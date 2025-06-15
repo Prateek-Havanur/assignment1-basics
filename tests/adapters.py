@@ -8,7 +8,8 @@ from jaxtyping import Float, Int
 import numpy.typing as npt
 import torch
 from torch import Tensor
-
+from cs336_basics.pretokenization_example import find_chunk_boundaries
+import regex as re
 
 
 def run_linear(
@@ -25,7 +26,7 @@ def run_linear(
         out_dim (int): The size of the output dimension
         weights (Float[Tensor, "d_out d_in"]): The linear weights to use
         in_features (Float[Tensor, "... d_in"]): The output tensor to apply the function to
-    
+
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
@@ -47,7 +48,7 @@ def run_embedding(
         d_model (int): The size of the embedding dimension
         weights (Float[Tensor, "vocab_size d_model"]): The embedding vectors to fetch from
         token_ids (Int[Tensor, "..."]): The set of token ids to fetch from the Embedding layer
-    
+
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
@@ -302,7 +303,7 @@ def run_transformer_lm(
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
         rope_theta (float): The RoPE $\Theta$ parameter.
-        weights (dict[str, Tensor]): 
+        weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
             The keys of this dictionary are:
@@ -435,7 +436,9 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
     raise NotImplementedError
 
 
-def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
+def run_cross_entropy(
+    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
 
@@ -451,7 +454,9 @@ def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: 
     raise NotImplementedError
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
@@ -588,4 +593,124 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    special_token_pattern = "|".join(re.escape(token) for token in special_tokens)
+    word_freqs = {}
+
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, 2, "<|endoftext|>".encode("utf-8"))
+
+        # The following is a serial implementation, but you can parallelize this
+        # by sending each start/end pair to a set of processes.
+        word_freqs = {}
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            text = re.split(f"({special_token_pattern})", chunk)
+            for segment in text:
+                if not segment:
+                    continue
+                # Check if this segment is a special token
+                if segment in special_tokens:
+                    # Special tokens are handled separately - they don't participate in BPE
+                    # They're already in the vocab as atomic units, so we skip them here
+                    continue
+                else:
+                    # Regular text - apply GPT-2 regex pattern
+                    for match in re.finditer(PAT, segment):
+                        token = match.group()
+                        token_bytes = tuple(token.encode("utf-8"))
+                        # print(token,"---",token_bytes)
+                        word_freqs[token_bytes] = word_freqs.get(token_bytes, 0) + 1
+
+    def get_count(mapped_list):
+        count = {}
+        for test_list, value in mapped_list.items():
+            test_list = list(test_list)
+            for a1, a2 in zip(test_list, test_list[1:]):
+                count[(a1, a2)] = count.get((a1, a2), 0) + value
+        return count
+
+    def merge_pair(test_list, pair, replacement):
+        i = 0
+        new_list = []
+        while i < len(test_list):
+            if (
+                i < len(test_list) - 1
+                and test_list[i] == pair[0]
+                and test_list[i + 1] == pair[1]
+            ):
+                new_list.append(replacement)
+                i = i + 2
+            else:
+                new_list.append(test_list[i])
+                i += 1
+        return new_list
+
+    def get_token_bytes(token_id, vocab_list):
+        """Get the bytes for a token ID"""
+        if token_id < 256:
+            return bytes([token_id])  # Single byte
+        else:
+            return vocab_list[token_id]  # Already merged token
+
+    def make_comparable_pair(pair, vocab_list):
+        """Convert pair elements to comparable format"""
+        a, b = pair
+        a_bytes = get_token_bytes(a, vocab_list)  # Use actual bytes
+        b_bytes = get_token_bytes(b, vocab_list)  # Use actual bytes
+        return (a_bytes, b_bytes)
+
+    # Initialize vocabulary
+    vocab_list = []
+    # Special tokens first
+    for special_token in special_tokens:
+        vocab_list.append(special_token.encode("utf-8"))
+    # All 256 bytes
+    for i in range(256):
+        vocab_list.append(bytes([i]))
+
+    num_merges = vocab_size - len(special_tokens) - 256
+
+    merges = []
+    for i in range(num_merges):
+        # print(f"----iteration {i}-----")
+        pair_counts = get_count(word_freqs)
+        # Find best pair with lexicographic tie-breaking
+        best_pair = max(
+            pair_counts.items(),
+            key=lambda x: (x[1], make_comparable_pair(x[0], vocab_list)),
+        )[0]
+        # best_pair
+
+        new_token_id = len(vocab_list)
+
+        first_bytes = get_token_bytes(best_pair[0], vocab_list)
+        second_bytes = get_token_bytes(best_pair[1], vocab_list)
+        merged_bytes = first_bytes + second_bytes
+
+        vocab_list.append(merged_bytes)
+
+        # print(merged_bytes)
+
+        new_word_freqs = {}
+        for words, freq in word_freqs.items():
+            merged_list = merge_pair(words, best_pair, new_token_id)
+            new_word_freqs[tuple(merged_list)] = freq
+
+        word_freqs = new_word_freqs
+        merges.append(best_pair)
+
+    # Build final outputs
+    vocab_dict = {i: token for i, token in enumerate(vocab_list)}
+
+    # Build merges_bytes with proper lookup
+    merges_bytes = []
+    for first, second in merges:
+        first_bytes = get_token_bytes(first, vocab_list)
+        second_bytes = get_token_bytes(second, vocab_list)
+        merges_bytes.append((first_bytes, second_bytes))
+
+    return vocab_dict, merges_bytes
