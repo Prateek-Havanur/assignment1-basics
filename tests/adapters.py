@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 import regex as re
+from concurrent.futures import ProcessPoolExecutor
 
 
 def run_linear(
@@ -566,6 +567,37 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+def process_chunk(args):
+    input_path, start, end, special_token_pattern, special_tokens = args
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    special_token_pattern = "|".join(re.escape(token) for token in special_tokens)
+    word_freqs = {}
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+        text = re.split(f"({special_token_pattern})", chunk)
+        for segment in text:
+            if not segment:
+                continue
+            # Check if this segment is a special token
+            if segment in special_tokens:
+                # Special tokens are handled separately - they don't participate in BPE
+                # They're already in the vocab as atomic units, so we skip them here
+                continue
+            else:
+                # Regular text - apply GPT-2 regex pattern
+                for match in re.finditer(PAT, segment):
+                    token = match.group()
+                    token_bytes = tuple(token.encode("utf-8"))
+                    # print(token,"---",token_bytes)
+                    word_freqs[token_bytes] = word_freqs.get(token_bytes, 0) + 1
+
+    return word_freqs
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -594,36 +626,28 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
 
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
     special_token_pattern = "|".join(re.escape(token) for token in special_tokens)
     word_freqs = {}
-
+    num_processes = 12
+    # We only need the file open briefly to find chunk boundaries
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, 2, "<|endoftext|>".encode("utf-8"))
+        boundaries = find_chunk_boundaries(f, 100, "<|endoftext|>".encode("utf-8"))
 
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        word_freqs = {}
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            text = re.split(f"({special_token_pattern})", chunk)
-            for segment in text:
-                if not segment:
-                    continue
-                # Check if this segment is a special token
-                if segment in special_tokens:
-                    # Special tokens are handled separately - they don't participate in BPE
-                    # They're already in the vocab as atomic units, so we skip them here
-                    continue
-                else:
-                    # Regular text - apply GPT-2 regex pattern
-                    for match in re.finditer(PAT, segment):
-                        token = match.group()
-                        token_bytes = tuple(token.encode("utf-8"))
-                        # print(token,"---",token_bytes)
-                        word_freqs[token_bytes] = word_freqs.get(token_bytes, 0) + 1
+    chunk_args = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        chunk_args.append(
+            (input_path, start, end, special_token_pattern, special_tokens)
+        )
+
+    num_processes = min(num_processes, len(chunk_args))
+
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        chunk_results = executor.map(process_chunk, chunk_args)
+
+        print(f"Number of chunks processed: {len(chunk_args)}")
+        for chunk_result in chunk_results:
+            for token_bytes, count in chunk_result.items():
+                word_freqs[token_bytes] = word_freqs.get(token_bytes, 0) + count
 
     def get_count(mapped_list):
         count = {}
