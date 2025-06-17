@@ -11,6 +11,94 @@ from torch import Tensor
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 import regex as re
 from concurrent.futures import ProcessPoolExecutor
+import pickle
+
+
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+        self.vocab = vocab
+        self.merges = dict(merges) if isinstance(merges, list) else merges
+        self.special_tokens = special_tokens or []
+        self.vocab_dict = {v: k for k, v in self.vocab.items()}
+
+    @classmethod
+    def from_file(cls, vocab_path, merges_path, special_tokens=None):
+        with open(vocab_path, "rb") as f:
+            vocab = pickle.load(f)
+        with open(merges_path, "rb") as f:
+            merges = pickle.load(f)
+
+        # Create and return a new instance
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text):
+        if not self.special_tokens:
+            special_token_pattern = ""
+            text_segments = [text]
+        else:
+            special_token_pattern = "|".join(
+                re.escape(token) for token in self.special_tokens
+            )
+            text_segments = re.split(f"({special_token_pattern})", text)
+
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+        words = []
+        for segment in text_segments:
+            if not segment:
+                continue
+            if self.special_tokens and segment in self.special_tokens:
+                # Handle special tokens - add them directly as a special token ID
+                special_token_bytes = segment.encode("utf-8")
+                if special_token_bytes in self.vocab_dict:
+                    words.append([special_token_bytes])
+                continue
+            else:
+                for match in re.finditer(PAT, segment):
+                    token = match.group()
+                    words.append([bytes([x]) for x in token.encode("utf-8")])
+
+        final_words = []
+        for word in words:
+            while True:
+                i = 0
+                merge_found = False
+                while i < len(word) - 1:
+                    if (word[i], word[i + 1]) in self.merges:
+                        word = word[:i] + [word[i] + word[i + 1]] + word[i + 2 :]
+                        merge_found = True
+                        break
+                    i = i + 1
+                if not merge_found:
+                    break
+            final_words.append(word)
+
+        # print(final_words)
+
+        tokenized_words = []  # print(word)
+        for word in final_words:
+            tokenized_word = []
+            for i in word:
+                tokenized_word.append(self.vocab_dict.get(i, "<UNK>"))
+            tokenized_words.extend(tokenized_word)
+        return tokenized_words
+
+    def encode_iterable(self, iterable):
+        for item in iterable:
+            yield self.encode(item)
+
+    def decode(self, token_ids):
+        """Decode token IDs back to text"""
+        # Step 1: Convert IDs to tokens
+        tokens = [self.vocab[token_id] for token_id in token_ids]
+
+        # Step 2: Concatenate all bytes
+        full_bytes = b"".join(tokens)
+
+        # Step 3: Decode to string
+        text = full_bytes.decode("utf-8")
+
+        return text
 
 
 def run_linear(
@@ -564,7 +652,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def process_chunk(args):
