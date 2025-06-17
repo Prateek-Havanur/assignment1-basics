@@ -17,8 +17,8 @@ import pickle
 class Tokenizer:
     def __init__(self, vocab, merges, special_tokens=None):
         self.vocab = vocab
-        self.merges = dict(merges) if isinstance(merges, list) else merges
-        self.special_tokens = special_tokens or []
+        self.merges = merges
+        self.special_tokens = special_tokens
         self.vocab_dict = {v: k for k, v in self.vocab.items()}
 
     @classmethod
@@ -32,27 +32,28 @@ class Tokenizer:
         return cls(vocab, merges, special_tokens)
 
     def encode(self, text):
-        if not self.special_tokens:
-            special_token_pattern = ""
-            text_segments = [text]
+
+        if self.special_tokens is None:
+            segments = [text]
+
         else:
+            # Sort special tokens by length (longest first) to ensure longest matches first
+            sorted_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
             special_token_pattern = "|".join(
-                re.escape(token) for token in self.special_tokens
+                re.escape(token) for token in sorted_special_tokens
             )
-            text_segments = re.split(f"({special_token_pattern})", text)
+            segments = re.split(f"({special_token_pattern})", text)
 
         PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
         words = []
-        for segment in text_segments:
+        for segment in segments:
             if not segment:
                 continue
             if self.special_tokens and segment in self.special_tokens:
-                # Handle special tokens - add them directly as a special token ID
+                # Handle special tokens - they should be encoded as single tokens
                 special_token_bytes = segment.encode("utf-8")
-                if special_token_bytes in self.vocab_dict:
-                    words.append([special_token_bytes])
-                continue
+                words.append([special_token_bytes])
             else:
                 for match in re.finditer(PAT, segment):
                     token = match.group()
@@ -61,16 +62,27 @@ class Tokenizer:
         final_words = []
         for word in words:
             while True:
-                i = 0
-                merge_found = False
-                while i < len(word) - 1:
-                    if (word[i], word[i + 1]) in self.merges:
-                        word = word[:i] + [word[i] + word[i + 1]] + word[i + 2 :]
-                        merge_found = True
-                        break
-                    i = i + 1
-                if not merge_found:
+                # Find the highest priority merge (earliest in merge list)
+                best_merge = None
+                best_pos = -1
+
+                for i in range(len(word) - 1):
+                    pair = (word[i], word[i + 1])
+                    if pair in self.merges:
+                        merge_priority = self.merges.index(pair)
+                        if best_merge is None or merge_priority < best_merge[1]:
+                            best_merge = (i, merge_priority)
+                            best_pos = i
+
+                if best_merge is None:
                     break
+
+                # Apply the best merge
+                word = (
+                    word[:best_pos]
+                    + [word[best_pos] + word[best_pos + 1]]
+                    + word[best_pos + 2 :]
+                )
             final_words.append(word)
 
         # print(final_words)
@@ -85,18 +97,20 @@ class Tokenizer:
 
     def encode_iterable(self, iterable):
         for item in iterable:
-            yield self.encode(item)
+            for token_id in self.encode(item):
+                yield token_id
 
-    def decode(self, token_ids):
+    def decode(self, tokens):
         """Decode token IDs back to text"""
         # Step 1: Convert IDs to tokens
-        tokens = [self.vocab[token_id] for token_id in token_ids]
+        tokens = [self.vocab[token_id] for token_id in tokens]
 
         # Step 2: Concatenate all bytes
         full_bytes = b"".join(tokens)
 
-        # Step 3: Decode to string
-        text = full_bytes.decode("utf-8")
+        # Step 3: Decode to string with error handling
+        # text = full_bytes.decode("utf-8")
+        text = full_bytes.decode("utf-8", errors="replace")
 
         return text
 
